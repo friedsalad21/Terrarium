@@ -1,0 +1,817 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Terrarium</title>
+<style>
+:root{--panel:rgba(14,20,32,.88);--line:#26344d;--text:#d8e2ee;--dim:#8193aa;--accent:#7fd18b}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:#07080c;color:var(--text);font:13px/1.4 system-ui,sans-serif;overflow:hidden}
+#view{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
+#view.tool{cursor:crosshair}
+aside{position:fixed;top:0;right:0;width:340px;height:100%;overflow-y:auto;background:var(--panel);border-left:1px solid var(--line);padding:12px 14px;backdrop-filter:blur(6px)}
+aside.hidden{display:none}
+#toggle{position:fixed;top:10px;right:350px;z-index:2}
+body.collapsed #toggle{right:10px}
+h1{font-size:18px;margin:0}
+h2{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin:14px 0 6px}
+.row{display:flex;gap:4px;flex-wrap:wrap;margin:6px 0}
+button,input{background:#1a2740;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:5px 9px;font:inherit;cursor:pointer}
+button:hover{border-color:#3d5378}
+button.on{background:#2c4a36;border-color:var(--accent)}
+input[type=text]{width:120px;cursor:text}
+input[type=range]{flex:1;padding:0}
+label{display:flex;gap:8px;align-items:center}
+canvas.chart{width:100%;height:110px;background:#0c1524;border-radius:6px;display:block}
+#stats,#inspect{display:grid;grid-template-columns:auto 1fr;gap:1px 12px}
+#stats b,#inspect b{font-weight:500;text-align:right}
+ol,ul{list-style:none;margin:0;padding:0}
+#species li,#civs li{display:flex;gap:6px;align-items:baseline;padding:2px 0;flex-wrap:wrap}
+small,#log li,.hint{color:var(--dim)}
+.sw{width:10px;height:10px;border-radius:50%;flex:none;align-self:center}
+#log li{padding:1px 0}
+.bar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;align-self:center}
+.bar i{display:block;height:100%;background:var(--accent)}
+@media(max-width:760px){aside{top:auto;bottom:0;width:100%;height:45vh;border-left:0;border-top:1px solid var(--line)}#toggle,body.collapsed #toggle{right:10px}}
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+<button id="toggle" title="Show or hide the panel">☰</button>
+<aside id="panel">
+  <h1>Terrarium</h1>
+  <div id="clock" class="hint"></div>
+  <h2>Time</h2><div class="row" id="speeds"></div>
+  <h2>Hand of god</h2><div class="row" id="tools"></div>
+  <label>Climate <input type="range" id="climate" min="-0.4" max="0.4" step="0.01" value="0"><span id="climateVal">0.00</span></label>
+  <h2>Terrarium</h2>
+  <div class="row"><button data-tank="box">Glass tank</button><button data-tank="globe">Glass globe</button></div>
+  <div class="row"><input type="text" id="seed" aria-label="World seed"><button id="newWorld">New world</button></div>
+  <h2>World</h2><div id="stats"></div>
+  <h2>Population</h2><canvas class="chart" id="popChart" width="600" height="220"></canvas>
+  <h2>Mean genes</h2><canvas class="chart" id="geneChart" width="600" height="220"></canvas>
+  <h2>Civilizations</h2><ol id="civs"></ol>
+  <h2>Living species</h2><ol id="species"></ol>
+  <h2>Inspector</h2><div id="inspect"></div>
+  <h2>Chronicle</h2><ul id="log"></ul>
+  <p class="hint">Drag to orbit, scroll to zoom into the glass. Pick a tool, then click the planet. Space pauses.</p>
+</aside>
+
+<!-- Simulation: plain script so its state is reachable from the console -->
+<script>
+'use strict';
+// ---- Calibration knobs: tweak these to rebalance the world ----
+const W = 320, H = 160, N = W * H;            // equirectangular planet grid (x wraps)
+const DAY = 200, YEAR = DAY * 24;             // ticks per day / per year
+const MAX = 12000, G = 9;                     // creature cap, genes per genome
+const CS = 8, GW = W / CS, GH = H / CS, NB = GW * GH; // spatial hash
+const PLANT_GROWTH = 0.0015, PLANT_ENERGY = 25, MEAT_DECAY = 0.003;
+const MUT_P = 0.1, MUT_SD = 0.05, COMPAT = 0.3, SPECIATE = 0.35, ESTABLISHED = 12;
+const SAPIENT_BRAIN = 0.6, BRAIN_DRIFT = 0.02, MAX_TOWNS = 400; // brain mutations lean upward so minds slowly grow
+const SPEEDF = [0.4, 0, 1.35, 1, 0.6, 0.6];   // per activity: wander, graze, hunt (sprint), flee, court, seek food
+const ACTS = ['wandering', 'grazing', 'hunting', 'fleeing', 'courting', 'seeking food'];
+const SEASONS = ['Spring', 'Summer', 'Autumn', 'Winter'];
+const ERAS = ['Stone Age', 'Bronze Age', 'Iron Age', 'Industrial Age', 'Atomic Age', 'Space Age'], ERA_TECH = [0, 40, 120, 300, 700, 1300];
+// Genes (all 0..1): 0 size, 1 speed, 2 sense, 3 diet (plants..meat), 4 hue, 5 preferred temp, 6 fecundity, 7 boldness, 8 brain
+
+const $ = id => document.getElementById(id);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const wrapX = x => x < 0 ? x + W : x >= W ? x - W : x;
+const wdx = d => d > W / 2 ? d - W : d < -W / 2 ? d + W : d;   // shortest x offset across the seam
+let rand;
+const mulberry32 = a => () => { a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+const gauss = () => (rand() + rand() + rand() + rand() - 2) * 1.732;
+
+// ---- World grids ----
+const height = new Float32Array(N), moist = new Float32Array(N), baseT = new Float32Array(N), ampT = new Float32Array(N);
+const plant = new Float32Array(N), meat = new Float32Array(N), fert = new Float32Array(N), GROUND = new Uint8Array(N * 3), colLight = new Float32Array(W);
+const cell = (x, y) => (y | 0) * W + (x | 0);
+let t = 0, season = 0, climate = 0, userClimate = 0, impact = 0, co2 = 0, worldVersion = 0;
+let spin = 0, spinRate = 6.2832 / DAY;        // planet rotation; the renderer may slow spinRate at high speed to avoid strobing
+const tempAt = c => baseT[c] + ampT[c] * season + climate;
+
+function makeNoise() {
+  const p = new Float32Array(4096).map(() => rand());
+  const at = (x, y, z) => p[(Math.imul(x, 73856093) ^ Math.imul(y, 19349663) ^ Math.imul(z, 83492791)) & 4095];
+  const sm = f => f * f * (3 - 2 * f), L = (a, b, k) => a + (b - a) * k;
+  return (x, y, z) => {
+    const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z), u = sm(x - xi), v = sm(y - yi), w = sm(z - zi);
+    return L(L(L(at(xi, yi, zi), at(xi + 1, yi, zi), u), L(at(xi, yi + 1, zi), at(xi + 1, yi + 1, zi), u), v),
+             L(L(at(xi, yi, zi + 1), at(xi + 1, yi, zi + 1), u), L(at(xi, yi + 1, zi + 1), at(xi + 1, yi + 1, zi + 1), u), v), w);
+  };
+}
+function fbm(noise, x, y, z) { let s = 0, a = 0.5; for (let o = 0; o < 5; o++, a *= 0.5, x *= 2.03, y *= 2.03, z *= 2.03) s += a * noise(x, y, z); return s / 0.97; }
+// grid coords -> unit sphere, same mapping as THREE.SphereGeometry UVs, so noise is seamless
+function sph(x, y, out) { const phi = x / W * 6.2832, th = y / H * Math.PI, s = Math.sin(th); out[0] = -Math.cos(phi) * s; out[1] = Math.cos(th); out[2] = Math.sin(phi) * s; return out; }
+function blur(a, r) {
+  const tmp = new Float32Array(N);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { let s = 0; for (let d = x - r; d <= x + r; d++) s += a[y * W + (d + W) % W]; tmp[y * W + x] = s / (2 * r + 1); }
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) { let s = 0, k = 0; for (let d = Math.max(0, y - r); d <= Math.min(H - 1, y + r); d++, k++) s += tmp[d * W + x]; a[y * W + x] = s / k; }
+}
+function groundColor(c) {
+  const h = height[c];
+  let r = 205, g = 190, b = 140;
+  if (h < 0) { const k = Math.min(1, -h * 2); r = 60 - 45 * k; g = 140 - 100 * k; b = 170 - 80 * k; }
+  else {
+    if (h > 0.03) { const k = moist[c]; r += (105 - r) * k; g += (90 - g) * k; b += (60 - b) * k; }
+    if (h > 0.55) { const k = Math.min(1, (h - 0.55) * 2.5); r += (128 - r) * k; g += (124 - g) * k; b += (120 - b) * k; }
+  }
+  GROUND[c * 3] = r; GROUND[c * 3 + 1] = g; GROUND[c * 3 + 2] = b;
+}
+
+function genWorld() {
+  const n1 = makeNoise(), n2 = makeNoise(), raw = new Float32Array(N), water = new Float32Array(N), P = [0, 0, 0];
+  for (let c = 0; c < N; c++) { sph(c % W + 0.5, (c / W | 0) + 0.5, P); raw[c] = fbm(n1, P[0] * 1.8, P[1] * 1.8, P[2] * 1.8); }
+  const s = Float32Array.from(raw).sort(), sea = s[N * 0.55 | 0], lo = s[0], hi = s[N - 1]; // ~45% land
+  for (let c = 0; c < N; c++) { height[c] = raw[c] < sea ? (raw[c] - sea) / (sea - lo) : (raw[c] - sea) / (hi - sea); water[c] = raw[c] < sea; }
+  blur(water, 7);
+  for (let c = 0; c < N; c++) {
+    const y = c / W | 0, lat = Math.abs(y / H - 0.5) * 2, h = height[c];
+    sph(c % W + 0.5, y + 0.5, P);
+    moist[c] = clamp(0.3 + water[c] * 0.8 + (fbm(n2, P[0] * 3, P[1] * 3, P[2] * 3) - 0.5) * 1.1 - Math.max(0, h - 0.5) * 0.5, 0.05, 1);
+    baseT[c] = 1.05 - lat * 1.1 - Math.max(0, h) * 0.7;              // warm equator, cold poles and peaks
+    ampT[c] = (0.06 + 0.3 * lat) * (y < H / 2 ? 1 : -1);             // seasons swing harder near poles, hemispheres opposite
+    fert[c] = 1; meat[c] = 0; plant[c] = h > 0 ? moist[c] * 0.6 : 0;
+    groundColor(c);
+  }
+  worldVersion++;
+}
+
+function updatePlants(dt) {
+  for (let x = 0; x < W; x++) colLight[x] = Math.max(0, -Math.cos(x / W * 6.2832 + spin)) * Math.PI; // sunlit hemisphere only
+  for (let c = 0; c < N; c++) {
+    if (meat[c] > 0.01) { const d = meat[c] * MEAT_DECAY * dt; meat[c] -= d; fert[c] = Math.min(2, fert[c] + d * 0.004); } // carcasses fertilise soil
+    if (height[c] <= 0) continue;
+    fert[c] += (1 - fert[c]) * 0.0002 * dt;
+    const T = tempAt(c), f = 1 - (T - 0.6) * (T - 0.6) * 4, cap = moist[c] * fert[c];
+    let b = plant[c];
+    if (f > 0) b += dt * PLANT_GROWTH * colLight[c % W] * f * (cap - b); // regrows from roots toward capacity
+    else b *= 1 - 0.002 * dt;                                        // winter die-back
+    plant[c] = b > 0 ? b : 0;
+  }
+}
+
+// ---- Creatures: structure-of-arrays, swap-removed ----
+const f32 = () => new Float32Array(MAX), i32 = () => new Int32Array(MAX), u8 = () => new Uint8Array(MAX);
+const X = f32(), Y = f32(), DX = f32(), DY = f32(), E = f32(), AGE = f32(), CD = f32(), R = f32(), M = f32(), SPD = f32(), SEN = f32(),
+  DIET = f32(), HE = f32(), CE = f32(), EMAX = f32(), LIFE = f32(), MAT = f32(), BASAL = f32(), BITE = f32(), TC = f32(), PREF = f32();
+const UID = i32(), SP = i32(), GEN = i32(), TGT = i32(), TUID = i32(), KIDS = i32(), ACT = u8(), DEAD = u8(), HB = u8();
+const GN = new Float32Array(MAX * G);
+const COLS = [X, Y, DX, DY, E, AGE, CD, R, M, SPD, SEN, DIET, HE, CE, EMAX, LIFE, MAT, BASAL, BITE, TC, PREF, UID, SP, GEN, TGT, TUID, KIDS, ACT, DEAD, HB];
+let n = 0, nextUid = 1, births = 0, deaths = 0, causes = [0, 0, 0, 0], species = [], towns = [];
+
+function setTraits(i) {
+  const o = i * G, s = 0.5 + 1.5 * GN[o], m = s * s * s, m75 = Math.pow(m, 0.75);
+  R[i] = 0.4 * s; M[i] = m; DIET[i] = GN[o + 3];
+  SPD[i] = (0.04 + 0.22 * GN[o + 1]) * Math.pow(s, 0.25);
+  SEN[i] = 2 + 12 * GN[o + 2];
+  HE[i] = Math.pow(1 - DIET[i], 1.5); CE[i] = Math.pow(DIET[i], 1.5); // generalists digest both poorly
+  EMAX[i] = 100 * m; BITE[i] = 0.02 * m75;
+  BASAL[i] = 0.02 * m75 * (1 + 0.5 * GN[o + 1] + 0.2 * GN[o + 8]) + 0.0008 * SEN[i]; // Kleiber metabolism + muscle + brain upkeep
+  TC[i] = 0.03 * Math.pow(m, 0.67);                                    // heat loss scales with surface area
+  LIFE[i] = DAY * 14 * Math.pow(s, 0.6); MAT[i] = DAY * 1.5 * Math.pow(s, 0.6);
+  PREF[i] = -0.1 + 1.2 * GN[o + 5];
+  HB[i] = Math.min(23, GN[o + 4] * 24 | 0) + (DIET[i] > 0.5 ? 24 : 0);
+}
+
+function born(x, y, sp, e, gen) {          // genes must already be in GN at slot n
+  const i = n++;
+  setTraits(i);
+  const a = rand() * 6.2832;
+  X[i] = wrapX(x); Y[i] = clamp(y, 0.5, H - 0.5); DX[i] = Math.cos(a); DY[i] = Math.sin(a);
+  E[i] = Math.min(e, EMAX[i]); AGE[i] = CD[i] = KIDS[i] = ACT[i] = DEAD[i] = 0; TGT[i] = -1;
+  UID[i] = nextUid++; SP[i] = sp; GEN[i] = gen; births++;
+  const s = species[sp];
+  if (++s.count > s.peak && ++s.peak === ESTABLISHED) log(s.parent < 0 ? `<b>${s.name}</b> settle the land` : `<b>${s.name}</b> branch off from ${species[s.parent].name}`);
+  return i;
+}
+
+function die(i, cause) {
+  if (DEAD[i]) return;
+  DEAD[i] = 1; deaths++; causes[cause]++;
+  meat[cell(X[i], Y[i])] += M[i] * 60 + Math.max(0, E[i]) * 0.5;
+  const s = species[SP[i]];
+  if (--s.count === 0) { s.died = t; if (s.peak >= ESTABLISHED) log(`<b>${s.name}</b> go extinct after ${((t - s.born) / YEAR).toFixed(1)} years`); }
+}
+
+function removeDead() {   // walk down so the slot we copy from (n-1) is always alive
+  for (let i = n - 1; i >= 0; i--) if (DEAD[i]) {
+    const j = --n;
+    if (i !== j) { for (const a of COLS) a[i] = a[j]; GN.copyWithin(i * G, j * G, j * G + G); }
+  }
+}
+
+// ---- Species ----
+const SYL = ['ka', 've', 'lo', 'mi', 'ru', 'ta', 'zo', 'pe', 'ni', 'sha', 'gor', 'ul', 'tri', 'bex', 'dra', 'fen', 'qua', 'yl', 'mor', 'ith', 'sel', 'an', 'or', 'cha'];
+function newSpecies(g, parent) {
+  let name = ''; for (let k = 2 + (rand() < 0.4); k > 0; k--) name += SYL[rand() * SYL.length | 0];
+  species.push({ name: name[0].toUpperCase() + name.slice(1), g, hue: g[4], count: 0, peak: 0, born: t, died: -1, parent, sapient: false, tech: 0, era: 0 });
+  return species.length - 1;
+}
+function genDist(A, oa, B, ob) {
+  let s = 0;
+  for (let k = 0; k < 8; k++) { let d = Math.abs(A[oa + k] - B[ob + k]); if (k === 4 && d > 0.5) d = 1 - d; s += d * d; } // brain (gene 8) excluded: minds can grow without splitting a species
+  return Math.sqrt(s);
+}
+function speciate(o, parent) {   // join a sibling lineage that already drifted the same way, else found a new one
+  for (let s = species.length - 1; s >= 0 && species[s].born > t - YEAR; s--)
+    if (species[s].parent === parent && genDist(GN, o, species[s].g, 0) < SPECIATE * 0.5) return s;
+  const s = newSpecies(GN.slice(o, o + G), parent);
+  if (species[parent].sapient) Object.assign(species[s], { sapient: true, tech: species[parent].tech, era: species[parent].era }); // culture is inherited
+  return s;
+}
+
+function reproduce(i, j) {
+  if (n >= MAX) return;
+  const o = n * G, oi = i * G, oj = j * G;
+  for (let k = 0; k < G; k++) {
+    let g = GN[(rand() < 0.5 ? oi : oj) + k];
+    if (rand() < MUT_P) g += gauss() * MUT_SD + (k === 8 ? BRAIN_DRIFT : 0);
+    GN[o + k] = k === 4 ? g - Math.floor(g) : clamp(g, 0, 1);
+  }
+  const fi = 0.2 + 0.4 * GN[oi + 6], fj = 0.2 + 0.4 * GN[oj + 6], e = E[i] * fi + E[j] * fj;
+  E[i] *= 1 - fi; E[j] *= 1 - fj;
+  let sp = SP[i];
+  if (genDist(GN, o, species[sp].g, 0) > SPECIATE) sp = speciate(o, sp);
+  born(X[i] + gauss() * 0.3, Y[i] + gauss() * 0.3, sp, e * 0.85, Math.max(GEN[i], GEN[j]) + 1);
+  CD[i] = MAT[i] * 0.4; CD[j] = MAT[j] * 0.4; KIDS[i]++; KIDS[j]++;
+}
+
+// ---- Spatial hash (counting sort, rebuilt every tick) ----
+const cellStart = new Int32Array(NB + 1), fillPos = new Int32Array(NB), order = new Int32Array(MAX), bucketOf = new Int32Array(MAX);
+function buildGrid() {
+  cellStart.fill(0);
+  for (let i = 0; i < n; i++) { const b = (Y[i] / CS | 0) * GW + (X[i] / CS | 0); bucketOf[i] = b; cellStart[b + 1]++; }
+  for (let b = 0; b < NB; b++) cellStart[b + 1] += cellStart[b];
+  fillPos.set(cellStart.subarray(0, NB));
+  for (let i = 0; i < n; i++) order[fillPos[bucketOf[i]]++] = i;
+}
+
+// ---- Behaviour ----
+const ATTENTION = 40;   // max neighbours one animal weighs per decision; bounds cost in crowds
+const NEAR_FIRST = [];
+for (let oy = -2; oy <= 2; oy++) for (let ox = -2; ox <= 2; ox++) NEAR_FIRST.push([ox, oy]);
+NEAR_FIRST.sort((a, b) => Math.hypot(...a) - Math.hypot(...b));
+// ponytail: distances use grid cells, so things near the poles move a little "faster" than on a true sphere.
+const foodAt = (c, i) => plant[c] * PLANT_ENERGY * HE[i] + meat[c] * CE[i];
+function setDir(i, x, y) { const l = Math.hypot(x, y) || 1; DX[i] = x / l; DY[i] = y / l; }
+
+function think(i) {
+  const x = X[i], y = Y[i], sen = SEN[i], sen2 = sen * sen, d = DIET[i], m = M[i], sp = SP[i], o = i * G;
+  const ready = AGE[i] > MAT[i] && CD[i] <= 0 && E[i] > 0.5 * EMAX[i];
+  const hunter = d > 0.5 && E[i] < 0.6 * EMAX[i];
+  let fx = 0, fy = 0, threat = 1e9, prey = -1, preyS = 0, mate = -1, mateD = 1e9;
+  const gx0 = Math.floor((x - sen) / CS), gx1 = Math.floor((x + sen) / CS);
+  const gy0 = Math.max(0, (y - sen) / CS | 0), gy1 = Math.min(GH - 1, (y + sen) / CS | 0);
+  const cx = x / CS | 0, cy = y / CS | 0;
+  let seen = 0;
+  scan: for (const [ox, oy] of NEAR_FIRST) {               // nearest buckets first, so the attention cap drops the far ones
+    const gr = cx + ox, gy = cy + oy;
+    if (gr < gx0 || gr > gx1 || gy < gy0 || gy > gy1) continue;
+    const b = gy * GW + (gr + GW) % GW;
+    for (let k = cellStart[b], end = cellStart[b + 1]; k < end; k++) {
+      const j = order[k];
+      if (j === i || DEAD[j]) continue;
+      const dx = wdx(X[j] - x), dy = Y[j] - y, d2 = dx * dx + dy * dy;
+      if (d2 > sen2) continue;
+      if (++seen > ATTENTION) break scan;
+      if (SP[j] !== sp) {
+        if (DIET[j] > 0.5 && DIET[j] > d && M[j] * 1.25 > m) { const w = 1 / (d2 + 0.1); fx -= dx * w; fy -= dy * w; if (d2 < threat) threat = d2; }
+        else if (hunter && M[j] < m * 1.25) { const s = M[j] / (d2 + 1); if (s > preyS) { preyS = s; prey = j; } }
+      } else if (ready && d2 < mateD && AGE[j] > MAT[j] && CD[j] <= 0 && E[j] > 0.4 * EMAX[j] && genDist(GN, o, GN, j * G) < COMPAT) { mate = j; mateD = d2; }
+    }
+  }
+  const bold = 1 - 0.8 * GN[o + 7];
+  if (threat < sen2 * bold * bold) { setDir(i, fx, fy); ACT[i] = 3; return; }
+  if (mate >= 0) { TGT[i] = mate; TUID[i] = UID[mate]; ACT[i] = 4; return; }
+  const here = foodAt(cell(x, y), i);
+  if (here > 2 * BITE[i] * PLANT_ENERGY && E[i] < 0.95 * EMAX[i]) { ACT[i] = 1; return; }
+  if (prey >= 0) { TGT[i] = prey; TUID[i] = UID[prey]; ACT[i] = 2; return; }
+  // forage: 8 neighbours plus random spots within sight; a bigger brain looks at more spots
+  let best = here * 1.2 + 0.3, bx = 0, by = 0;
+  for (let k = 0, samples = 12 + GN[o + 8] * 12; k < samples; k++) {
+    let px, py;
+    if (k < 8) { const a = k * 0.785; px = x + Math.cos(a) * 1.2; py = y + Math.sin(a) * 1.2; }
+    else { const a = rand() * 6.2832, r = 2 + rand() * sen; px = x + Math.cos(a) * r; py = y + Math.sin(a) * r; }
+    if (py < 0 || py >= H) continue;
+    const c = cell(wrapX(px), py);
+    if (height[c] <= 0) continue;
+    const v = foodAt(c, i) / (1 + Math.hypot(px - x, py - y) * 0.08);
+    if (v > best) { best = v; bx = px - x; by = py - y; }
+  }
+  if (bx || by) { setDir(i, bx, by); ACT[i] = 5; }
+  else if (here > 0.5) ACT[i] = 1;
+  else { ACT[i] = 0; const a = Math.atan2(DY[i], DX[i]) + gauss() * 0.5; DX[i] = Math.cos(a); DY[i] = Math.sin(a); }
+}
+
+function act(i) {
+  let a = ACT[i], v = SPD[i] * SPEEDF[a];
+  if (a === 2 || a === 4) {
+    const j = TGT[i];
+    if (j >= n || UID[j] !== TUID[i] || DEAD[j]) { ACT[i] = 0; v = SPD[i] * SPEEDF[0]; }
+    else {
+      const dx = wdx(X[j] - X[i]), dy = Y[j] - Y[i], dd = Math.hypot(dx, dy);
+      if (dd < R[i] + R[j] + 0.5) {
+        v = 0;
+        if (a === 2) {                                   // strike: odds favour the bigger, smarter, more carnivorous animal
+          E[i] -= BITE[i] * 2;
+          if (rand() < 0.25 * M[i] / (M[i] + M[j]) * DIET[i] * (0.6 + 0.8 * GN[i * G + 8]) * (species[SP[j]].sapient ? 0.1 : 1)) { die(j, 2); ACT[i] = 1; }
+        } else { ACT[i] = 0; if (ACT[j] !== 3) ACT[j] = 0; if (CD[j] <= 0 && CD[i] <= 0) reproduce(i, j); }
+      } else { DX[i] = dx / dd; DY[i] = dy / dd; if (dd < v) v = dd; }
+    }
+  }
+  let c = cell(X[i], Y[i]);
+  const T = tempAt(c);
+  if (v > 0) {
+    const h = height[c];
+    if (h < 0 && T >= 0) v *= 0.4; else if (h > 0.6) v *= 0.6;   // wading / climbing
+    const nx = wrapX(X[i] + DX[i] * v), ny = Y[i] + DY[i] * v;
+    const nc = ny < 0.5 || ny > H - 0.5 ? -1 : cell(nx, ny);
+    if (nc < 0 || (height[nc] < -0.12 && tempAt(nc) >= 0)) {  // deep unfrozen water: turn away (frozen seas are bridges)
+      const r = rand() * 6.2832; DX[i] = Math.cos(r); DY[i] = Math.sin(r); v = 0;
+    } else { X[i] = nx; Y[i] = ny; c = nc; }
+  }
+  const dT = T - PREF[i];
+  let e = E[i] - BASAL[i] * (AGE[i] > LIFE[i] * 0.8 ? 2 : 1) - 0.4 * M[i] * v * v - TC[i] * dT * dT;
+  if (species[SP[i]].sapient) e += BASAL[i] * 0.6;                    // farming covers most upkeep
+  if (e < EMAX[i]) {
+    if (HE[i] > 0.05 && plant[c] > 0) { const b = BITE[i] * plant[c] / (plant[c] + 0.8); plant[c] -= b; e += b * PLANT_ENERGY * HE[i]; } // Holling type II grazing
+    if (CE[i] > 0.05 && meat[c] > 0) { const b = Math.min(meat[c], BITE[i] * 30); meat[c] -= b; e += b * CE[i] * 0.6; }
+  }
+  E[i] = Math.min(e, EMAX[i]); AGE[i]++; CD[i]--;
+  if (e <= 0) die(i, 0); else if (AGE[i] > LIFE[i]) die(i, 1);
+}
+
+// ---- Civilizations: towns grow, spread, fight and burn carbon ----
+function townNear(x, y, r) { for (const tw of towns) if (wdx(tw.x - x) ** 2 + (tw.y - y) ** 2 < r * r) return tw; return null; }
+function civDay() {
+  if (t === YEAR / 2) { seedLife(3, -1, true); log("Predators wander in, following the herds"); }
+  else if (t % (YEAR * 3) === 0 && n > 300 && !DIET.subarray(0, n).some(d => d > 0.5)) { seedLife(2, -1, true); log("Hunters migrate in from beyond the mountains"); }
+  impact *= 0.97; co2 *= 0.998;
+  climate = userClimate + 0.1 * Math.sin(t / (YEAR * 40) * 6.2832) - impact + co2 * 0.0015; // ice-age cycle, impact winter, greenhouse
+  const L = species.length, brain = new Float32Array(L), civPop = new Float32Array(L);
+  for (let i = 0; i < n; i++) brain[SP[i]] += GN[i * G + 8];
+  for (let s = 0; s < L; s++) {
+    const q = species[s];
+    if (!q.sapient && (q.uplift || q.count >= 30 && brain[s] / q.count > SAPIENT_BRAIN)) { q.sapient = true; log(`<b>${q.name}</b> become self-aware and light their first fires`); }
+  }
+  for (let i = 0; i < n && towns.length < MAX_TOWNS; i++)
+    if (species[SP[i]].sapient && rand() < 0.003 && height[cell(X[i], Y[i])] > 0 && !townNear(X[i], Y[i], 6)) towns.push({ x: X[i], y: Y[i], sp: SP[i], pop: 5 });
+  for (const tw of towns) {
+    const q = species[tw.sp], c = cell(tw.x, tw.y), comfort = Math.max(0.05, 1 - Math.abs(tempAt(c) - (q.g[5] * 1.2 - 0.1)) * 2);
+    const cap = (30 + 120 * moist[c]) * (1 + q.era * 0.8) * comfort;
+    if (q.count === 0) tw.pop *= 0.9;                                   // abandoned: ruins fade
+    else tw.pop += tw.pop * 0.04 * (1 - tw.pop / cap);
+    if (q.count > 0 && tw.pop > cap * 0.7 && towns.length < MAX_TOWNS && rand() < 0.03) {
+      const a = rand() * 6.2832, d = 5 + rand() * 5, x = wrapX(tw.x + Math.cos(a) * d), y = tw.y + Math.sin(a) * d;
+      if (y > 1 && y < H - 1 && height[cell(x, y)] > 0 && !townNear(x, y, 5)) towns.push({ x, y, sp: tw.sp, pop: 5 });
+    }
+    civPop[tw.sp] += tw.pop;
+    if (q.era >= 3) co2 += tw.pop * 0.0005;
+  }
+  if (towns.length > 1 && rand() < 0.05) {
+    const a = towns[rand() * towns.length | 0], b = towns[rand() * towns.length | 0];
+    if (a.sp !== b.sp && wdx(a.x - b.x) ** 2 + (a.y - b.y) ** 2 < 225) {
+      const [win, lose] = a.pop > b.pop ? [a, b] : [b, a];
+      log(`War: the ${species[win.sp].name} raze a ${species[lose.sp].name} town of ${lose.pop | 0}`); lose.pop = 0;
+    }
+  }
+  towns = towns.filter(tw => tw.pop >= 1);
+  for (let s = 0; s < L; s++) {
+    const q = species[s];
+    if (!q.sapient) continue;
+    q.tech += Math.sqrt(civPop[s]) * 0.02;                   // ideas grow with population, with diminishing returns
+    while (q.era < 5 && q.tech >= ERA_TECH[q.era + 1]) log(`<b>${q.name}</b> enter the ${ERAS[++q.era]}`);
+  }
+}
+
+// ---- God tools (cx, cy in grid cells) ----
+function around(cx, cy, r, fn) {
+  for (let dy = -r; dy <= r; dy++) for (let dx = -r; dx <= r; dx++) {
+    const d = Math.hypot(dx, dy), y = (cy | 0) + dy;
+    if (d <= r && y >= 0 && y < H) fn(y * W + wrapX((cx | 0) + dx), d / r);
+  }
+}
+function creaturesNear(cx, cy, r, fn) { for (let i = 0; i < n; i++) if (wdx(X[i] - cx) ** 2 + (Y[i] - cy) ** 2 < r * r) fn(i); }
+function rainAt(cx, cy) {
+  around(cx, cy, 10, (c, k) => { moist[c] = Math.min(1, moist[c] + 0.35 * (1 - k)); if (height[c] > 0) plant[c] += 0.3 * (1 - k); groundColor(c); });
+  log('Rain falls from a clear sky');
+}
+function meteorAt(cx, cy) {
+  around(cx, cy, 8, (c, k) => { height[c] -= 0.35 * (1 - k * k); plant[c] = 0; fert[c] = 0.3; groundColor(c); });
+  creaturesNear(cx, cy, 8, i => die(i, 3));
+  const before = towns.length; towns = towns.filter(tw => wdx(tw.x - cx) ** 2 + (tw.y - cy) ** 2 > 64);
+  impact += 0.3; climate -= 0.3; worldVersion++;
+  log(`A meteor strikes${before > towns.length ? `, erasing ${before - towns.length} towns` : ''}. Dust darkens the sky`);
+}
+function monolithAt(cx, cy) {
+  const touched = new Set();                         // every species that touches it is uplifted, not just the individuals
+  creaturesNear(cx, cy, 12, i => touched.add(SP[i]));
+  touched.forEach(s => species[s].uplift = true);
+  for (let i = 0; i < n; i++) if (touched.has(SP[i])) { GN[i * G + 8] = Math.min(1, GN[i * G + 8] + 0.45); setTraits(i); }
+  log(touched.size ? `A black monolith appears. The ${[...touched].map(s => species[s].name).join(' and ')} feel their minds open` : 'A black monolith stands alone; nothing lives nearby');
+}
+function seedAt(cx, cy, carn) { seedLife(1, cell(cx, cy), carn); log(`New ${carn ? 'hunters' : 'grazers'} arrive`); }
+
+// ponytail: sim runs on the main thread under a frame budget; move step() into a Worker if MAX must go far past 12k.
+function step() {
+  season = Math.sin(t / YEAR * 6.2832);
+  buildGrid();
+  const n0 = n;
+  for (let i = 0; i < n0; i++) {
+    if (DEAD[i]) continue;
+    if (((UID[i] + t) & 3) === 0) think(i);   // decisions every 4 ticks (staggered), movement every tick
+    act(i);
+  }
+  removeDead();
+  if ((t & 3) === 0) updatePlants(4);
+  spin = (spin + spinRate) % 6.2832;
+  t++;
+  if (t % DAY === 0) civDay();
+  if (t % histEvery === 0) sample();
+  if (n === 0 && !extinctLogged) { extinctLogged = true; log('All life has perished. Use <b>Grazers</b> to try again.'); }
+}
+
+function seedLife(groups, at = -1, carnOnly = null) {
+  extinctLogged = false;
+  for (let s = 0; s < groups; s++) {
+    let c = at, tries = 0;
+    if (c < 0 && carnOnly && n) { const k = rand() * n | 0; c = cell(X[k], Y[k]); } // hunters arrive where the herds are
+    else if (c < 0) do c = rand() * N | 0; while ((height[c] <= 0.03 || moist[c] < 0.3 || baseT[c] < 0.2) && ++tries < 5000);
+    const carn = carnOnly ?? s % 4 === 3, g = new Float32Array(G).map(rand);
+    if (carn) { g[0] = 0.35 + 0.35 * rand(); g[2] = 0.5 + 0.4 * rand(); g[3] = 0.8 + 0.15 * rand(); } else g[3] = 0.15 * rand();
+    g[5] = clamp((baseT[c] + 0.1) / 1.2, 0, 1); g[8] = rand() * 0.35;
+    const sp = newSpecies(g, -1), cx = c % W + 0.5, cy = (c / W | 0) + 0.5;
+    for (let k = carn ? 8 : 30; k > 0 && n < MAX; k--) {
+      for (let q = 0; q < G; q++) GN[n * G + q] = clamp(g[q] + gauss() * 0.02, 0, 1);
+      let x = wrapX(cx + gauss() * 3), y = cy + gauss() * 3;
+      if (y < 0 || y >= H || height[cell(x, y)] <= 0) { x = cx; y = cy; }
+      const i = born(x, y, sp, 0, 0);
+      E[i] = 0.8 * EMAX[i]; AGE[i] = rand() * MAT[i] * 1.5;
+    }
+  }
+}
+
+// ---- History & chronicle ----
+let hist, histEvery, extinctLogged = false;
+function sample() {
+  let h = 0, c = 0, pl = 0, people = 0; const gm = [0, 0, 0, 0, 0], GI = [0, 1, 2, 3, 8];
+  for (let i = 0; i < n; i++) { DIET[i] > 0.5 ? c++ : h++; for (let k = 0; k < 5; k++) gm[k] += GN[i * G + GI[k]]; }
+  for (let k = 0; k < N; k++) pl += plant[k];
+  for (const tw of towns) people += tw.pop;
+  const v = [h, c, pl, ...gm.map(s => n ? s / n : 0), people];
+  hist.forEach((a, k) => a.push(v[k]));
+  if (hist[0].length > 400) { hist = hist.map(a => a.filter((_, i) => i % 2 === 0)); histEvery *= 2; }
+}
+function log(msg) {
+  const li = document.createElement('li');
+  li.innerHTML = `Y${(t / YEAR | 0) + 1} D${((t % YEAR) / DAY | 0) + 1}: ${msg}`;
+  $('log').prepend(li);
+  while ($('log').children.length > 80) $('log').lastChild.remove();
+}
+
+function newWorld(seed) {
+  seed = String(seed); $('seed').value = seed; history.replaceState(null, '', '#' + seed);
+  let h = 2166136261; for (const ch of seed) h = Math.imul(h ^ ch.charCodeAt(0), 16777619);
+  rand = mulberry32(h);
+  n = 0; t = 0; births = deaths = 0; causes = [0, 0, 0, 0]; species = []; towns = [];
+  climate = impact = co2 = spin = 0;
+  hist = Array.from({ length: 9 }, () => []); histEvery = DAY / 2; $('log').innerHTML = '';
+  genWorld(); seedLife(9, -1, false);
+  log('A new world forms inside the glass.');
+}
+
+// Self-check: run selfTest() in the console; it simulates 20 days and asserts the bookkeeping holds.
+function selfTest() {
+  newWorld('test');
+  for (let k = 0; k < DAY * 20; k++) step();
+  console.assert(n > 0, 'life survived 20 days');
+  console.assert(species.reduce((s, q) => s + q.count, 0) === n, 'species counts match population');
+  for (let i = 0; i < n; i++) console.assert(E[i] > 0 && E[i] <= EMAX[i] && X[i] >= 0 && X[i] < W && Y[i] >= 0 && Y[i] <= H && !DEAD[i], 'creature state valid', i);
+  return `self-test done: ${n} creatures, ${species.length} lineages, ${births} births, ${deaths} deaths`;
+}
+</script>
+
+<!-- Rendering + UI -->
+<script type="importmap">{"imports":{"three":"./lib/three.module.js"}}</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from './lib/OrbitControls.js';
+
+const R0 = 1.25, RELIEF = 0.04;
+const renderer = new THREE.WebGLRenderer({ canvas: $('view'), antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.autoClear = false;
+const camera = new THREE.PerspectiveCamera(42, 1, 0.02, 100);
+camera.position.set(6, 5.5, 9);
+const controls = new OrbitControls(camera, renderer.domElement);
+Object.assign(controls, { enableDamping: true, minDistance: 1.6, maxDistance: 22, maxPolarAngle: Math.PI * 0.49 });
+
+// Two scenes so the room lamp never lights the planet's night side: inner (bottled space) first, room on top.
+const inner = new THREE.Scene(), room = new THREE.Scene();
+inner.background = new THREE.Color(0x07080c);
+const world = new THREE.Group(), spinner = new THREE.Group();
+inner.add(world); world.add(spinner);
+inner.add(new THREE.AmbientLight(0x6070a0, 0.25));
+
+const canvasTex = (w, h, draw) => { const c = document.createElement('canvas'); c.width = w; c.height = h; draw?.(c.getContext('2d'), w, h); const tx = new THREE.CanvasTexture(c); tx.colorSpace = THREE.SRGBColorSpace; return tx; };
+const glowTex = canvasTex(64, 64, (g) => { const r = g.createRadialGradient(32, 32, 0, 32, 32, 32); r.addColorStop(0, 'rgba(255,240,200,1)'); r.addColorStop(0.25, 'rgba(255,200,120,.55)'); r.addColorStop(1, 'rgba(255,160,80,0)'); g.fillStyle = r; g.fillRect(0, 0, 64, 64); });
+const dotTex = canvasTex(32, 32, (g) => { g.fillStyle = '#fff'; g.beginPath(); g.arc(16, 16, 14, 0, 7); g.fill(); });
+const ringTex = canvasTex(64, 64, (g) => { g.strokeStyle = '#fff'; g.lineWidth = 6; g.beginPath(); g.arc(32, 32, 26, 0, 7); g.stroke(); });
+
+// Tiny sun inside the glass on +X: the sim's day/night maths assumes exactly this direction.
+const sun = new THREE.Mesh(new THREE.SphereGeometry(0.16, 24, 16), new THREE.MeshBasicMaterial({ color: 0xfff1c8 }));
+sun.position.set(2.45, 0, 0); world.add(sun);
+const sunGlow = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, blending: THREE.AdditiveBlending, depthWrite: false }));
+sunGlow.scale.setScalar(1.3); sun.add(sunGlow);
+const sunLight = new THREE.PointLight(0xfff4e0, 3, 0, 0); sun.add(sunLight);
+
+// Stars bottled inside the glass
+{
+  const p = [];
+  while (p.length < 1800) { const v = new THREE.Vector3(Math.random() * 6 - 3, Math.random() * 4.1 - 2.05, Math.random() * 4.1 - 2.05); if (v.length() < 2.75 && v.length() > 1.7) p.push(v.x, v.y, v.z); }
+  const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.Float32BufferAttribute(p, 3));
+  world.add(new THREE.Points(g, new THREE.PointsMaterial({ size: 0.018, color: 0xcfd8ff, transparent: true, opacity: 0.8 })));
+}
+
+// Planet: one sphere whose texture, specular (water) and emissive (city lights) maps are painted from the sim grids
+const terrainTex = canvasTex(W, H), lightsTex = canvasTex(W, H), specTex = canvasTex(W, H);
+const tctx = terrainTex.image.getContext('2d'), timg = tctx.createImageData(W, H);
+const lctx = lightsTex.image.getContext('2d'), limg = lctx.createImageData(W, H);
+const planetGeo = new THREE.SphereGeometry(R0, W, H);
+const planet = new THREE.Mesh(planetGeo, new THREE.MeshPhongMaterial({ map: terrainTex, specularMap: specTex, specular: 0x8899aa, shininess: 40, emissiveMap: lightsTex, emissive: 0xffc070 }));
+spinner.add(planet);
+const unit = planetGeo.attributes.position.array.slice(); // undisplaced positions
+const cloudTex = canvasTex(512, 256);
+const clouds = new THREE.Mesh(new THREE.SphereGeometry(R0 * 1.05, 96, 48), new THREE.MeshPhongMaterial({ map: cloudTex, transparent: true, depthWrite: false, opacity: 0.8 }));
+world.add(clouds);
+world.add(new THREE.Mesh(new THREE.SphereGeometry(R0 * 1.12, 64, 32), new THREE.ShaderMaterial({
+  vertexShader: 'varying vec3 vN,vV;void main(){vec4 p=modelViewMatrix*vec4(position,1.);vN=normalize(normalMatrix*normal);vV=normalize(-p.xyz);gl_Position=projectionMatrix*p;}',
+  fragmentShader: 'varying vec3 vN,vV;void main(){float f=pow(1.-abs(dot(vN,vV)),4.);gl_FragColor=vec4(.45,.7,1.,1.)*f*.9;}',
+  blending: THREE.AdditiveBlending, transparent: true, depthWrite: false
+})));
+
+function rebuildRelief() {   // displace land vertices, refresh the water specular map
+  const pos = planetGeo.attributes.position, uv = planetGeo.attributes.uv;
+  for (let k = 0; k < pos.count; k++) {
+    const x = (uv.getX(k) * W | 0) % W, y = Math.min(H - 1, (1 - uv.getY(k)) * H | 0), s = 1 + Math.max(0, height[y * W + x]) * RELIEF;
+    pos.setXYZ(k, unit[k * 3] * s, unit[k * 3 + 1] * s, unit[k * 3 + 2] * s);
+  }
+  pos.needsUpdate = true; planetGeo.computeVertexNormals();
+  const sctx = specTex.image.getContext('2d'), simg = sctx.createImageData(W, H);
+  for (let c = 0; c < N; c++) { const v = height[c] < 0 ? 255 : 10; simg.data.set([v, v, v, 255], c * 4); }
+  sctx.putImageData(simg, 0, 0); specTex.needsUpdate = true;
+}
+function paintClouds() {
+  const g = cloudTex.image.getContext('2d'), img = g.createImageData(512, 256), nz = makeNoise(), P = [0, 0, 0];
+  for (let y = 0; y < 256; y++) for (let x = 0; x < 512; x++) {
+    sph(x / 512 * W, y / 256 * H, P);
+    const v = clamp((fbm(nz, P[0] * 3, P[1] * 6, P[2] * 3) - 0.52) * 4, 0, 1), p = (y * 512 + x) * 4;
+    img.data[p] = img.data[p + 1] = img.data[p + 2] = 255; img.data[p + 3] = v * 220;
+  }
+  g.putImageData(img, 0, 0); cloudTex.needsUpdate = true;
+}
+function paintTerrain() {
+  const d = timg.data, l = limg.data;
+  for (let c = 0, p = 0; c < N; c++, p += 4) {
+    let r = GROUND[c * 3], g = GROUND[c * 3 + 1], b = GROUND[c * 3 + 2];
+    const T = tempAt(c);
+    if (height[c] > 0) {
+      const v = Math.min(1, Math.sqrt(plant[c] * 2)) * 0.9, dry = 1 - moist[c];
+      r += (45 + 80 * dry - r) * v; g += (110 + 30 * dry - g) * v; b += (40 + 20 * dry - b) * v;
+      if (meat[c] > 3) { const k = Math.min(0.7, meat[c] / 150); r += (150 - r) * k; g += (25 - g) * k; b += (25 - b) * k; }
+      if (T < 0.08) { const k = Math.min(0.9, (0.08 - T) * 8); r += (238 - r) * k; g += (243 - g) * k; b += (250 - b) * k; }
+    } else if (T < 0) { const k = Math.min(0.85, -T * 10); r += (200 - r) * k; g += (222 - g) * k; b += (238 - b) * k; }
+    d[p] = r; d[p + 1] = g; d[p + 2] = b; d[p + 3] = 255;
+    l[p] = l[p + 1] = l[p + 2] = 0; l[p + 3] = 255;
+  }
+  for (const tw of towns) {                                   // towns: grey sprawl by day, lights on the night side
+    const era = species[tw.sp].era, rr = Math.max(1, Math.min(5, Math.sqrt(tw.pop) / 3.5)), x = tw.x | 0;
+    const night = clamp(Math.cos(x / W * 6.2832 + spin) * 3, 0, 1), glow = Math.min(1, tw.pop / 80) * (0.35 + 0.13 * era) * night * 255;
+    around(tw.x, tw.y, Math.ceil(rr), (c, k) => {
+      if (height[c] <= 0 || k > rr / Math.ceil(rr)) return;
+      const p = c * 4, s = 0.6 * (1 - k * 0.5);
+      d[p] += (125 - d[p]) * s; d[p + 1] += (118 - d[p + 1]) * s; d[p + 2] += (108 - d[p + 2]) * s;
+      l[p] = Math.max(l[p], glow * (1 - k * 0.6)); l[p + 1] = l[p] * 0.8; l[p + 2] = l[p] * 0.45;
+    });
+  }
+  tctx.putImageData(timg, 0, 0); lctx.putImageData(limg, 0, 0);
+  terrainTex.needsUpdate = lightsTex.needsUpdate = true;
+}
+
+// Creatures as one point cloud riding on the spinning planet
+const PAL = new Float32Array(48 * 3), tmpC = new THREE.Color();
+for (let b = 0; b < 48; b++) { tmpC.setHSL((b % 24) / 24, b < 24 ? 0.6 : 0.85, b < 24 ? 0.66 : 0.42, THREE.SRGBColorSpace); PAL.set([tmpC.r, tmpC.g, tmpC.b], b * 3); }
+const cPos = new Float32Array(MAX * 3), cCol = new Float32Array(MAX * 3), creatureGeo = new THREE.BufferGeometry();
+creatureGeo.setAttribute('position', new THREE.BufferAttribute(cPos, 3).setUsage(THREE.DynamicDrawUsage));
+creatureGeo.setAttribute('color', new THREE.BufferAttribute(cCol, 3).setUsage(THREE.DynamicDrawUsage));
+const creatures = new THREE.Points(creatureGeo, new THREE.PointsMaterial({ size: 0.022, vertexColors: true, map: dotTex, alphaTest: 0.5 }));
+creatures.frustumCulled = false; spinner.add(creatures);
+const marker = new THREE.Sprite(new THREE.SpriteMaterial({ map: ringTex, depthTest: false, color: 0xffffff }));
+marker.scale.setScalar(0.07); marker.visible = false; spinner.add(marker);
+function surface(x, y, out, lift = 0.006) {
+  const phi = x / W * 6.2832, th = y / H * Math.PI, s = Math.sin(th), r = R0 * (1 + Math.max(0, height[cell(x, y)]) * RELIEF) + lift;
+  return out.set(-Math.cos(phi) * s * r, Math.cos(th) * r, Math.sin(phi) * s * r);
+}
+const v3 = new THREE.Vector3();
+function updateCreatures() {
+  for (let i = 0; i < n; i++) {
+    surface(X[i], Y[i], v3); cPos[i * 3] = v3.x; cPos[i * 3 + 1] = v3.y; cPos[i * 3 + 2] = v3.z;
+    const b = HB[i] * 3; cCol[i * 3] = PAL[b]; cCol[i * 3 + 1] = PAL[b + 1]; cCol[i * 3 + 2] = PAL[b + 2];
+  }
+  creatureGeo.setDrawRange(0, n);
+  creatureGeo.attributes.position.needsUpdate = creatureGeo.attributes.color.needsUpdate = true;
+}
+
+// Satellites once someone reaches the Space Age
+const SATS = 60, satPos = new Float32Array(SATS * 3), satOrb = Array.from({ length: SATS }, () => [Math.random() * 6.28, (Math.random() - 0.5) * 2.5, R0 * (1.25 + Math.random() * 0.4), 0.3 + Math.random() * 0.5]);
+const satGeo = new THREE.BufferGeometry(); satGeo.setAttribute('position', new THREE.BufferAttribute(satPos, 3));
+world.add(new THREE.Points(satGeo, new THREE.PointsMaterial({ size: 0.02, color: 0xe8f4ff })));
+function updateSats(now) {
+  const tech = species.reduce((m, q) => q.count > 0 && q.tech > m ? q.tech : m, 0), k = clamp((tech - ERA_TECH[5]) / 15 | 0, 0, SATS);
+  satOrb.forEach(([ph, inc, r, sp], i) => {
+    const a = ph + now * 0.0003 * sp;
+    satPos.set([Math.cos(a) * r, Math.sin(a) * Math.sin(inc) * r, Math.sin(a) * Math.cos(inc) * r], i * 3);
+  });
+  satGeo.setDrawRange(0, k); satGeo.attributes.position.needsUpdate = true;
+}
+
+// ---- The room: desk, lamp, glass ----
+room.add(new THREE.AmbientLight(0x8a90a8, 0.35));
+const lamp = new THREE.SpotLight(0xffd9a8, 2.2, 0, 0.75, 0.6, 0);
+lamp.position.set(-7, 12, 6); room.add(lamp, lamp.target);
+const wood = canvasTex(512, 512, (g) => {
+  g.fillStyle = '#4a2f1d'; g.fillRect(0, 0, 512, 512);
+  for (let y = 0; y < 512; y++) { g.fillStyle = `rgba(${30 + Math.random() * 40},${15 + Math.random() * 20},8,${0.15 + 0.25 * Math.abs(Math.sin(y * 0.09 + Math.sin(y * 0.013) * 4))})`; g.fillRect(0, y, 512, 1); }
+});
+wood.wrapS = wood.wrapT = THREE.RepeatWrapping; wood.repeat.set(3, 3);
+const desk = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), new THREE.MeshPhongMaterial({ map: wood, shininess: 25, specular: 0x222222 }));
+desk.rotation.x = -Math.PI / 2; room.add(desk);
+const glassMat = new THREE.MeshPhongMaterial({ color: 0xaaccdd, transparent: true, opacity: 0.08, shininess: 140, specular: 0xffffff, depthWrite: false });
+const darkMat = new THREE.MeshPhongMaterial({ color: 0x14171c, shininess: 60 }), baseMat = new THREE.MeshPhongMaterial({ map: wood, color: 0x8a6a55 });
+const voidMat = new THREE.MeshBasicMaterial({ color: 0x04060b, side: THREE.BackSide });
+const tanks = {
+  box: { y: 2.5, room: new THREE.Group(), inner: new THREE.Mesh(new THREE.BoxGeometry(6.3, 4.3, 4.3), voidMat) },
+  globe: { y: 3.3, room: new THREE.Group(), inner: new THREE.Mesh(new THREE.SphereGeometry(2.88, 64, 32), voidMat) },
+};
+{
+  const box = new THREE.BoxGeometry(6.4, 4.4, 4.4), glass = new THREE.Mesh(box, glassMat), frame = new THREE.LineSegments(new THREE.EdgesGeometry(box), new THREE.LineBasicMaterial({ color: 0x2a2f38 }));
+  glass.position.y = frame.position.y = 2.5;
+  const lid = new THREE.Mesh(new THREE.BoxGeometry(6.55, 0.1, 4.55), darkMat); lid.position.y = 4.75;
+  const base = new THREE.Mesh(new THREE.BoxGeometry(6.7, 0.3, 4.7), baseMat); base.position.y = 0.15;
+  tanks.box.room.add(glass, frame, lid, base);
+  const ball = new THREE.Mesh(new THREE.SphereGeometry(2.92, 64, 32), glassMat); ball.position.y = 3.3;
+  const stand = new THREE.Mesh(new THREE.CylinderGeometry(1.5, 1.9, 0.6, 48), baseMat); stand.position.y = 0.3;
+  tanks.globe.room.add(ball, stand);
+}
+let tankKind = 'box';
+function setTank(kind) {
+  tankKind = kind;
+  for (const [k, tk] of Object.entries(tanks)) { tk.room.removeFromParent(); tk.inner.removeFromParent(); if (k === kind) { room.add(tk.room); inner.add(tk.inner); } }
+  tanks[kind].inner.position.y = world.position.y = tanks[kind].y;
+  controls.target.set(0, tanks[kind].y, 0); lamp.target.position.set(0, tanks[kind].y, 0);
+  document.querySelectorAll('[data-tank]').forEach(b => b.classList.toggle('on', b.dataset.tank === kind));
+}
+document.querySelectorAll('[data-tank]').forEach(b => b.onclick = () => setTank(b.dataset.tank));
+
+// ---- Tools: click the planet ----
+const TOOLS = [['inspect', 'Inspect'], ['rain', 'Rain'], ['meteor', 'Meteor'], ['grazers', 'Grazers'], ['hunters', 'Hunters'], ['monolith', 'Monolith']];
+let tool = 'inspect', selUid = 0;
+TOOLS.forEach(([k, label]) => { const b = document.createElement('button'); b.textContent = label; b.dataset.tool = k; b.onclick = () => setTool(k); $('tools').append(b); });
+function setTool(k) { tool = k; document.querySelectorAll('[data-tool]').forEach(b => b.classList.toggle('on', b.dataset.tool === k)); $('view').classList.toggle('tool', k !== 'inspect'); }
+
+const ray = new THREE.Raycaster(), ndc = new THREE.Vector2();
+let down = null;
+$('view').addEventListener('pointerdown', e => { down = [e.clientX, e.clientY]; });
+$('view').addEventListener('pointerup', e => {
+  if (!down || Math.hypot(e.clientX - down[0], e.clientY - down[1]) > 5) return;
+  ndc.set(e.clientX / innerWidth * 2 - 1, -e.clientY / innerHeight * 2 + 1);
+  ray.setFromCamera(ndc, camera);
+  const hit = ray.intersectObject(planet)[0];
+  if (!hit) { if (tool === 'inspect') selUid = 0; return; }
+  const x = (hit.uv.x * W) % W, y = Math.min(H - 0.5, (1 - hit.uv.y) * H);
+  if (tool === 'inspect') {
+    let best = -1, bd = 9;
+    for (let i = 0; i < n; i++) { const d = wdx(X[i] - x) ** 2 + (Y[i] - y) ** 2; if (d < bd) { bd = d; best = i; } }
+    selUid = best >= 0 ? UID[best] : 0;
+  } else if (tool === 'meteor') dropMeteor(x, y);
+  else if (tool === 'rain') rainAt(x, y);
+  else if (tool === 'grazers' || tool === 'hunters') seedAt(x, y, tool === 'hunters');
+  else monolithAt(x, y);
+});
+
+const meteors = [];
+const rockMat = new THREE.MeshBasicMaterial({ color: 0xffa040 });
+function dropMeteor(x, y) {
+  const to = surface(x, y, new THREE.Vector3(), 0), rock = new THREE.Mesh(new THREE.SphereGeometry(0.03, 8, 6), rockMat);
+  const trail = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, blending: THREE.AdditiveBlending, depthWrite: false }));
+  trail.scale.setScalar(0.25); rock.add(trail); spinner.add(rock);
+  meteors.push({ x, y, rock, from: to.clone().multiplyScalar(2.1), to, k: 0, flash: null });
+}
+function updateMeteors() {
+  for (let q = meteors.length - 1; q >= 0; q--) {
+    const m = meteors[q];
+    if (!m.flash) {
+      m.k += 0.025; m.rock.position.lerpVectors(m.from, m.to, m.k * m.k);
+      if (m.k >= 1) {
+        m.rock.removeFromParent(); meteorAt(m.x, m.y);
+        m.flash = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, blending: THREE.AdditiveBlending, depthWrite: false, transparent: true }));
+        m.flash.position.copy(m.to); spinner.add(m.flash);
+      }
+    } else {
+      m.k += 0.03; m.flash.scale.setScalar(0.2 + (m.k - 1) * 3); m.flash.material.opacity = Math.max(0, 2 - m.k);
+      if (m.k > 2) { m.flash.removeFromParent(); meteors.splice(q, 1); }
+    }
+  }
+}
+
+// ---- Panel ----
+function chart(id, lines, fixedMax) {
+  const c = $(id).getContext('2d'), w = 600, h = 220;
+  c.clearRect(0, 0, w, h); c.font = '20px system-ui'; c.lineWidth = 2.5;
+  let mx = fixedMax || 1;
+  if (!fixedMax) for (const l of lines) if (!l.own) for (const v of l.d) if (v > mx) mx = v;
+  lines.forEach((l, k) => {
+    const m = l.own ? Math.max(1e-9, ...l.d) : mx, len = l.d.length - 1 || 1;
+    c.strokeStyle = c.fillStyle = l.c; c.globalAlpha = l.own ? 0.55 : 1;
+    c.beginPath(); l.d.forEach((v, i) => c[i ? 'lineTo' : 'moveTo'](i / len * w, h - 4 - v / m * (h - 34))); c.stroke();
+    c.globalAlpha = 1; c.fillText(l.n, 8 + k * 112, 22);
+  });
+  if (!fixedMax) { c.fillStyle = '#8193aa'; c.textAlign = 'right'; c.fillText(Math.round(mx), w - 6, 22); c.textAlign = 'left'; }
+}
+const dietName = d => d < 0.35 ? 'herbivore' : d > 0.65 ? 'carnivore' : 'omnivore';
+const rows = r => r.map(([k, v]) => `<span>${k}</span><b>${v}</b>`).join('');
+function updatePanel(sel) {
+  const hr = (6 + (t % DAY) / DAY * 24) % 24 | 0;
+  $('clock').textContent = `Year ${(t / YEAR | 0) + 1}, day ${((t % YEAR) / DAY | 0) + 1}, ${String(hr).padStart(2, '0')}:00, ${SEASONS[(t % YEAR) / (YEAR / 4) | 0]} in the north`;
+  let h = 0, c = 0, mg = 0, people = 0;
+  for (let i = 0; i < n; i++) { DIET[i] > 0.5 ? c++ : h++; if (GEN[i] > mg) mg = GEN[i]; }
+  for (const tw of towns) people += tw.pop;
+  const alive = species.filter(s => s.count > 0 && s.peak >= ESTABLISHED).sort((a, b) => b.count - a.count);
+  $('stats').innerHTML = rows([['Creatures', n], ['Herbivores', h], ['Carnivores', c], ['Species', alive.length], ['Towns', towns.length], ['People', people | 0],
+    ['Births', births], ['Deaths', deaths], ['Starved / old / eaten', causes.slice(0, 3).join(' / ')], ['Latest generation', mg],
+    ['Climate', `${climate >= 0 ? '+' : ''}${climate.toFixed(2)}`], ['Speed', `${tps} ticks/s`], ['1 sim year', tps ? `${(YEAR / tps).toFixed(1)} s real` : 'paused']]);
+  const sw = s => `<span class="sw" style="background:hsl(${s.hue * 360 | 0},65%,60%)"></span><b>${s.name}</b>`;
+  const civs = species.filter(s => s.sapient && (s.count > 0 || towns.some(tw => tw.sp === species.indexOf(s)))).sort((a, b) => b.tech - a.tech).slice(0, 8);
+  $('civs').innerHTML = civs.map(s => { const id = species.indexOf(s), ts = towns.filter(tw => tw.sp === id); return `<li>${sw(s)}<small>${ERAS[s.era]}, ${ts.length} towns, ${ts.reduce((a, tw) => a + tw.pop, 0) | 0} people${s.count ? '' : ', extinct'}</small></li>`; }).join('')
+    || '<li class="hint">No one is self-aware yet. Brains evolve slowly; a Monolith helps.</li>';
+  $('species').innerHTML = alive.slice(0, 10).map(s => `<li>${sw(s)}${s.count} <small>${dietName(s.g[3])}${s.sapient ? ', sapient' : ''}${s.parent >= 0 ? ', from ' + species[s.parent].name : ''}</small></li>`).join('') || '<li class="hint">None</li>';
+  if (sel >= 0) {
+    const o = sel * G, cc = cell(X[sel], Y[sel]);
+    $('inspect').innerHTML = rows([['Species', species[SP[sel]].name], ['Doing', ACTS[ACT[sel]]], ['Generation', GEN[sel]], ['Age', `${(AGE[sel] / DAY).toFixed(1)} of ${(LIFE[sel] / DAY).toFixed(0)} days`],
+      ['Energy', `<div class="bar"><i style="width:${E[sel] / EMAX[sel] * 100}%"></i></div>`], ['Diet', `${dietName(DIET[sel])} (${DIET[sel].toFixed(2)})`],
+      ['Mass', M[sel].toFixed(2)], ['Speed', SPD[sel].toFixed(3)], ['Sight', SEN[sel].toFixed(1)], ['Brain', GN[o + 8].toFixed(2)],
+      ['Comfort temp', `${PREF[sel].toFixed(2)} (here ${tempAt(cc).toFixed(2)})`], ['Offspring', KIDS[sel]]]);
+  } else $('inspect').innerHTML = '<span class="hint">Use Inspect and click a creature.</span>';
+  chart('popChart', [{ d: hist[0], c: '#7fd18b', n: 'herbivores' }, { d: hist[1], c: '#ff6b6b', n: 'carnivores' }, { d: hist[2], c: '#5c8f4a', n: 'plants', own: true }, { d: hist[8], c: '#ffc070', n: 'people', own: true }]);
+  chart('geneChart', [{ d: hist[3], c: '#e0c060', n: 'size' }, { d: hist[4], c: '#6bc7ff', n: 'speed' }, { d: hist[5], c: '#c58cff', n: 'sight' }, { d: hist[6], c: '#ff6b6b', n: 'diet' }, { d: hist[7], c: '#ffffff', n: 'brain' }], 1);
+}
+
+// ---- Controls & main loop ----
+const SPEEDS = [['Pause', 0], ['1×', 1], ['4×', 4], ['16×', 16], ['64×', 64], ['Max', 1e9]];
+let speed = 1, lastSpeed = 1, tps = 0, tickCount = 0, lastSec = performance.now(), frameNo = 0, lastTicks = 1, seenVersion = -1;
+function setSpeed(s) { if (s) lastSpeed = s; speed = s; [...$('speeds').children].forEach((b, k) => b.classList.toggle('on', SPEEDS[k][1] === s)); }
+SPEEDS.forEach(([label, s]) => { const b = document.createElement('button'); b.textContent = label; b.onclick = () => setSpeed(s); $('speeds').append(b); });
+$('climate').oninput = e => { userClimate = +e.target.value; $('climateVal').textContent = userClimate.toFixed(2); };
+$('newWorld').onclick = () => { newWorld($('seed').value.trim() || Math.random().toString(36).slice(2, 8)); paintClouds(); selUid = 0; };
+$('seed').onkeydown = e => { if (e.key === 'Enter') $('newWorld').click(); };
+$('toggle').onclick = () => { $('panel').classList.toggle('hidden'); document.body.classList.toggle('collapsed'); };
+addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  if (e.code === 'Space') { e.preventDefault(); setSpeed(speed ? 0 : lastSpeed); }
+  if (e.key === 'Escape') { selUid = 0; setTool('inspect'); }
+});
+function resize() { renderer.setSize(innerWidth, innerHeight, false); camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix(); }
+addEventListener('resize', resize);
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  let ticks = 0;
+  if (speed) {
+    spinRate = Math.min(6.2832 / DAY, 0.03 / lastTicks);  // cap visual spin so fast-forward doesn't strobe
+    const t0 = performance.now(), budget = speed > 64 ? 26 : 12;
+    for (let k = 0; k < speed; k++) { step(); ticks++; if ((k & 3) === 3 && performance.now() - t0 > budget) break; }
+  }
+  lastTicks = Math.max(1, ticks); tickCount += ticks;
+  if (now - lastSec > 1000) { tps = Math.round(tickCount * 1000 / (now - lastSec)); tickCount = 0; lastSec = now; }
+  if (seenVersion !== worldVersion) { seenVersion = worldVersion; rebuildRelief(); }
+  if (frameNo % 4 === 0) paintTerrain();
+  spinner.rotation.y = spin; clouds.rotation.y = spin * 1.04 + now * 0.00002;
+  updateCreatures(); updateMeteors(); updateSats(now);
+  let sel = -1;
+  if (selUid) { for (let i = 0; i < n; i++) if (UID[i] === selUid) { sel = i; break; } if (sel < 0) selUid = 0; }
+  marker.visible = sel >= 0;
+  if (sel >= 0) surface(X[sel], Y[sel], marker.position, 0.02);
+  controls.update();
+  renderer.clear(); renderer.render(inner, camera); renderer.render(room, camera);
+  if (frameNo % 15 === 0) updatePanel(sel);
+  frameNo++;
+}
+
+resize(); setTank('box'); setTool('inspect'); setSpeed(1);
+newWorld(location.hash.slice(1) || Math.random().toString(36).slice(2, 8)); paintClouds();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
